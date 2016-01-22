@@ -3,7 +3,18 @@
 module OctoRelocator
 
 import Base: GMP, Bottom, svec, unsafe_convert, uncompressed_ast
+import Base: get!, getindex, setindex!
 import Core: arrayref, arrayset
+
+# a much faster ObjectIdDict, but which does not guarantee object uniqueness for isbits objects
+type FuzzyDict
+    dict::Dict{UInt, Int}
+    FuzzyDict() = new(Dict{UInt, Int}())
+end
+get!(d::FuzzyDict, k::ANY, v) = get!(d.dict, UInt(pointer_from_objref(k)), v)
+getindex(d::FuzzyDict, k::ANY) = getindex(d.dict, UInt(pointer_from_objref(k)))
+setindex!(d::FuzzyDict, v, k::ANY) = setindex!(d.dict, v, UInt(pointer_from_objref(k)))
+typealias ObjectIdDict FuzzyDict
 
 if !isdefined(Base,:unsafe_write)
 unsafe_write(s::IO, p::Ptr{UInt8}, nb::UInt) = write(s, p, Int(nb))
@@ -160,7 +171,8 @@ function jl_field_isptr(t::DataType, i::Int) # 1 <= i <= nfields(t)
 end
 
 @inline function fastserialize_any(s::SerializationState, obj::ANY)
-    if isa(obj, DataType) || isa(obj, Symbol) || isa(obj, Module) || isa(obj, Union)
+    t = typeof(obj)
+    if is(t, DataType) || is(t, Symbol) || is(t, Module) || is(t, Union)
         return serialize_header_obj(s, obj)
     end
     xid = get!(s.serialized, obj, s.ocounter)::Int
@@ -182,11 +194,11 @@ function fastserialize(s::SerializationState, obj::ANY)
         x = workq[xid]
         tag = sertag(x)
         if tag <= 0
-            if isa(x, Array)
+            t = typeof(x)::DataType
+            @assert !(is(t, DataType) || is(t, Symbol) || is(t, Module) || is(t, Union))
+            if is(t.name, Array.name)
                 serialize_array(s, x, xid)
-            elseif isa(x, DataType) || isa(x, Symbol) || isa(x, Module) || isa(x, Union)
-                @assert false
-            elseif isa(x, SimpleVector)
+            elseif is(t, SimpleVector)
                 #serialize_sv(s, x::SimpleVector, xid)
                 sv = x::SimpleVector
                 for i in 1:length(sv)
@@ -194,7 +206,6 @@ function fastserialize(s::SerializationState, obj::ANY)
                     push!(relocations, (xid, i, id))
                 end
             else
-                t = typeof(x)::DataType
                 t_tag = sertag(t)
                 t_tag <= 0 && serialize_header_obj(s, t)
                 nf = nfields(t)
@@ -220,11 +231,10 @@ function fastserialize(s::SerializationState, obj::ANY)
             write_as_tag(s.io, tag)
         else
             t = typeof(x)::DataType
-            if isa(x, Array)
+            @assert !(is(t, DataType) || is(t, Symbol) || is(t, Module) || is(t, Union))
+            if is(t.name, Array.name)
                 serialize_array(s, x::Array, 0)
-            elseif isa(x, DataType) || isa(x, Symbol) || isa(x, Module) || isa(x, Union)
-                @assert false
-            elseif isa(x, SimpleVector)
+            elseif is(t, SimpleVector)
                 #serialize_sv(s, x::SimpleVector, 0)
                 sv = x::SimpleVector
                 writetag(s.io, SIMPLEVECTOR_TAG)
