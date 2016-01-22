@@ -44,30 +44,20 @@ end
 serialize(x) = serialize(PipeBuffer(), x)
 
 const TAGS = Any[
-    Symbol, Int8, UInt8, Int16, UInt16, Int32, UInt32,
+    Int8, UInt8, Int16, UInt16, Int32, UInt32,
     Int64, UInt64, Int128, UInt128, Float32, Float64, Char, Ptr,
     DataType, Union, Function,
-    Tuple, Array, Expr,
-    #LongSymbol, LongTuple, LongExpr,
-    Symbol, Tuple, Expr,  # dummy entries, intentionally shadowed by earlier ones
+    Tuple, Array, Bool, Any, Type, Tuple{},
+    Symbol, #=LongSymbol=#Symbol, # dummy entry, intentionally shadowed by earlier ones
     LineNumberNode, SymbolNode, LabelNode, GotoNode,
     QuoteNode, TopNode, TypeVar, Box, LambdaStaticData,
     Module, #=UndefRefTag=#Symbol, Task, ASCIIString, UTF8String,
     UTF16String, UTF32String, Float16,
-    SimpleVector, #=Any Value=#Symbol, :reserved11, :reserved12,
+    SimpleVector, #=Any Value=#Symbol,
 
-    (), Bool, Any, :Any, Bottom, :reserved21, :reserved22, Type,
-    :Array, :TypeVar, :Box, :Tuple,
-    :lambda, :body, :return, :call, symbol("::"),
-    :(=), :null, :gotoifnot, :A, :B, :C, :M, :N, :T, :S, :X, :Y,
-    :a, :b, :c, :d, :e, :f, :g, :h, :i, :j, :k, :l, :m, :n, :o,
-    :p, :q, :r, :s, :t, :u, :v, :w, :x, :y, :z,
-    :add_int, :sub_int, :mul_int, :add_float, :sub_float,
-    :mul_float, :unbox, :box,
-    :eq_int, :slt_int, :sle_int, :ne_int,
-    :arrayset, :arrayref,
-    :Core, :Base, svec(), Tuple{},
-    :reserved17, :reserved18, :reserved19,
+    (), :Any, Bottom,
+    :Array, :TypeVar, :Tuple,
+    :Core, :Base, svec(),
     false, true, nothing, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
     12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
     28, 29, 30, 31, 32
@@ -75,12 +65,18 @@ const TAGS = Any[
 
 const ser_version = 3 # do not make changes without bumping the version #!
 
-const NTAGS = length(TAGS)
-
 @inline function sertag(v::ANY)
     ptr = pointer_from_objref(v)
     ptags = convert(Ptr{Ptr{Void}}, pointer(TAGS))
-    @inbounds for i = 1:NTAGS
+    t = typeof(v)
+    if is(t,DataType)
+        s = 1
+        e = VALUE_TAGS - 1
+    else
+        s = VALUE_TAGS
+        e = ZERO_TAG - 1
+    end
+    @inbounds for i = s:e
         ptr == unsafe_load(ptags,i) && return (i+1)%Int32
     end
     return Int32(-1)
@@ -88,21 +84,17 @@ end
 desertag(i::Int32) = TAGS[i-1]
 
 # tags >= this just represent themselves, their whole representation is 1 byte
-const VALUE_TAGS = sertag(())
-const ZERO_TAG = sertag(0)
+const VALUE_TAGS = (findfirst(x -> x === (), TAGS) + 1)%Int32
+const ZERO_TAG = (findfirst(x -> x === 0, TAGS) + 1)%Int32
 const TRUE_TAG = sertag(true)
 const FALSE_TAG = sertag(false)
 const EMPTYTUPLE_TAG = sertag(())
-const TUPLE_TAG = sertag(Tuple)
-const LONGTUPLE_TAG = Int32(sertag(Expr)+2)
 const SIMPLEVECTOR_TAG = sertag(SimpleVector)
 const SYMBOL_TAG = sertag(Symbol)
-const LONGSYMBOL_TAG = Int32(sertag(Expr)+1)
+const LONGSYMBOL_TAG = Int32(sertag(Symbol)+1)
 const ARRAY_TAG = sertag(Array)
 const UNDEFREF_TAG = Int32(sertag(Module)+1)
 const VALUE_TAG = Int32(sertag(SimpleVector)+1)
-const EXPR_TAG = sertag(Expr)
-const LONGEXPR_TAG = Int32(sertag(Expr)+3)
 const MODULE_TAG = sertag(Module)
 const FUNCTION_TAG = sertag(Function)
 const LAMBDASTATICDATA_TAG = sertag(LambdaStaticData)
