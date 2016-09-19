@@ -1,8 +1,9 @@
 # This file is a part of Julia. License is MIT: http://julialang.org/license
-#__precompile__()
+__precompile__()
+
 module OctoRelocator
 
-import Base: GMP, Bottom, svec, unsafe_convert, uncompressed_ast
+import Base: GMP, Bottom, unsafe_convert, uncompressed_ast
 import Base: get!, getindex, setindex!
 import Core: arrayref, arrayset
 
@@ -16,8 +17,9 @@ getindex(d::FuzzyDict, k::ANY) = getindex(d.dict, UInt(pointer_from_objref(k)))
 setindex!(d::FuzzyDict, v, k::ANY) = setindex!(d.dict, v, UInt(pointer_from_objref(k)))
 typealias ObjectIdDict FuzzyDict
 
-if !isdefined(Base,:unsafe_write)
+if !isdefined(Base, :unsafe_write)
 unsafe_write(s::IO, p::Ptr{UInt8}, nb::UInt) = write(s, p, Int(nb))
+unsafe_read(s::IO, p::Ptr{UInt8}, nb::UInt) = unsafe_copy(p, pointer(read(s, Array{UInt8}(nb))), nb)
 end
 
 export serialize, deserialize
@@ -43,27 +45,51 @@ function serialize(s::IO, x)
 end
 serialize(x) = serialize(PipeBuffer(), x)
 
+if VERSION < v"0.5-" || VERSION > v"0.7-"
+    error("Serializer not defined for this version.")
+elseif VERSION >= v"0.6-"
 const TAGS = Any[
     Int8, UInt8, Int16, UInt16, Int32, UInt32,
     Int64, UInt64, Int128, UInt128, Float32, Float64, Char, Ptr,
-    DataType, Union, Function,
-    Tuple, Array, Bool, Any, Type, Tuple{},
+    DataType, Union, TypeName,
+    Tuple, Array,
+    Bool, Any, Type, Tuple{},
     Symbol, #=LongSymbol=#Symbol, # dummy entry, intentionally shadowed by earlier ones
-    LineNumberNode, SymbolNode, LabelNode, GotoNode,
-    QuoteNode, TopNode, TypeVar, Box, LambdaStaticData,
-    Module, #=UndefRefTag=#Symbol, Task, ASCIIString, UTF8String,
-    UTF16String, UTF32String, Float16,
-    SimpleVector, #=Any Value=#Symbol,
+    LineNumberNode, Slot, LabelNode, GotoNode,
+    QuoteNode, CodeInfo, TypeVar, Core.Box, Core.MethodInstance,
+    Module, #=UndefRefTag=#Symbol, Task, String, Float16,
+    SimpleVector, #=Any Value=#Symbol, Method, GlobalRef,
 
     (), :Any, Bottom,
     :Array, :TypeVar, :Tuple,
-    :Core, :Base, svec(),
+    :Core, :Base, Core.svec(),
     false, true, nothing, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
     12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
     28, 29, 30, 31, 32
 ]
+elseif VERSION >= v"0.5-"
+const TAGS = Any[
+    Int8, UInt8, Int16, UInt16, Int32, UInt32,
+    Int64, UInt64, Int128, UInt128, Float32, Float64, Char, Ptr,
+    DataType, Union, TypeName,
+    Tuple, Array,
+    Bool, Any, Type, Tuple{},
+    Symbol, #=LongSymbol=#Symbol, # dummy entry, intentionally shadowed by earlier ones
+    LineNumberNode, Slot, LabelNode, GotoNode,
+    QuoteNode, #=reserved=#Symbol, TypeVar, Core.Box, LambdaInfo,
+    Module, #=UndefRefTag=#Symbol, Task, String, Float16,
+    SimpleVector, #=Any Value=#Symbol, Method, GlobalRef,
 
-const ser_version = 3 # do not make changes without bumping the version #!
+    (), :Any, Bottom,
+    :Array, :TypeVar, :Tuple,
+    :Core, :Base, Core.svec(),
+    false, true, nothing, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+    12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+    28, 29, 30, 31, 32
+]
+end
+
+const ser_version = 4 # do not make changes without bumping the version #!
 
 @inline function sertag(v::ANY)
     ptr = pointer_from_objref(v)
@@ -86,9 +112,6 @@ desertag(i::Int32) = TAGS[i-1]
 # tags >= this just represent themselves, their whole representation is 1 byte
 const VALUE_TAGS = (findfirst(x -> x === (), TAGS) + 1)%Int32
 const ZERO_TAG = (findfirst(x -> x === 0, TAGS) + 1)%Int32
-const TRUE_TAG = sertag(true)
-const FALSE_TAG = sertag(false)
-const EMPTYTUPLE_TAG = sertag(())
 const SIMPLEVECTOR_TAG = sertag(SimpleVector)
 const SYMBOL_TAG = sertag(Symbol)
 const LONGSYMBOL_TAG = Int32(sertag(Symbol)+1)
@@ -96,8 +119,6 @@ const ARRAY_TAG = sertag(Array)
 const UNDEFREF_TAG = Int32(sertag(Module)+1)
 const VALUE_TAG = Int32(sertag(SimpleVector)+1)
 const MODULE_TAG = sertag(Module)
-const FUNCTION_TAG = sertag(Function)
-const LAMBDASTATICDATA_TAG = sertag(LambdaStaticData)
 const TASK_TAG = sertag(Task)
 const DATATYPE_TAG = sertag(DataType)
 const INT_TAG = sertag(Int)
@@ -111,8 +132,10 @@ function write_as_tag(s::IO, tag)
     nothing
 end
 
-macro writefield(s, x, xptr, t, i, fldty) # precondition: isbits(fldty::DataType)
-    return esc(quote unsafe_write(s.io, convert(Ptr{UInt8}, xptr + Base.field_offset(t, i)), UInt(fldty.size)) end)
+macro writefield(s, x, xptr, t, i, fldty) # precondition: isbits(fldty::DataType) && 1 <= i <= nfields(t)
+    return esc(quote
+        unsafe_write(s.io, convert(Ptr{UInt8}, xptr + fieldoffset(t, i)), UInt(fldty.size))
+    end)
     #ccall(:jl_set_nth_field, Void, (Any, Csize_t, Any), x, i-1, read(s.io, fldty))
 end
 
@@ -122,44 +145,57 @@ function readfield{T}(::Type{T}, s::IO, fptr)
     nothing
 end
 
-macro readfield(s, x, xptr, t, i, fldty) # precondition: isbits(fldty::DataType)
+macro readfield(s, x, xptr, t, i, fldty) # precondition: isbits(fldty::DataType) && 1 <= i <= nfields(t)
+    return esc(quote
+        unsafe_read(s.io, convert(Ptr{UInt8}, xptr + Base.fieldoffset(t, i)), UInt(fldty.size))
+    end)
     return esc(quote
         fldsz = $fldty.size
         if fldsz == 1
-            readfield(UInt8, s.io, xptr + Base.field_offset(t, i))
+            readfield(UInt8, s.io, xptr + Base.field_offset(t, i - 1))
         elseif fldsz == 2
-            readfield(UInt16, s.io, xptr + Base.field_offset(t, i))
+            readfield(UInt16, s.io, xptr + Base.field_offset(t, i - 1))
         elseif fldsz == 4
-            readfield(UInt32, s.io, xptr + Base.field_offset(t, i))
+            readfield(UInt32, s.io, xptr + Base.field_offset(t, i - 1))
         elseif fldsz == 8
-            readfield(UInt64, s.io, xptr + Base.field_offset(t, i))
+            readfield(UInt64, s.io, xptr + Base.field_offset(t, i - 1))
         else
-            readfield($fldty, s.io, xptr + Base.field_offset(t, i))
+            readfield($fldty, s.io, xptr + Base.field_offset(t, i - 1))
         end
         #ccall(:jl_set_nth_field, Void, (Any, Csize_t, Any), x, i-1, read(s.io, fldty))
     end)
 end
 
-LLT_ALIGN(v::Unsigned, typ::DataType) = (v + Base.type_alignment(typ) - 1) & ~UInt(Base.type_alignment(typ) - 1)
-const fielddesc_type_offset = LLT_ALIGN(Base.field_offset(DataType,
-        findfirst(Base.fieldnames(DataType), :ninitialized) - 1) +
-    sizeof(fieldtype(DataType, :ninitialized)), UInt32) + sizeof(UInt32)
-const fielddesc_offset = LLT_ALIGN(
-    LLT_ALIGN(fielddesc_type_offset + sizeof(UInt32), Ptr{Void}) + 2 * sizeof(Ptr{Void}),
-    DataType)
-function jl_field_isptr(t::DataType, i::Int) # 1 <= i <= nfields(t)
-    tptr = pointer_from_objref(t)
-    fielddesc_type = (unsafe_load(convert(Ptr{UInt32}, tptr) + fielddesc_type_offset) & 0xd0000000) >> 30
-    i = 2 * i
-    if fielddesc_type == 0
-        isptr = (unsafe_load(convert(Ptr{UInt8}, tptr) + fielddesc_offset, i) >> 7) != 0
-    elseif fielddesc_type == 1
-        isptr = (unsafe_load(convert(Ptr{UInt16}, tptr) + fielddesc_offset, i) >> 15) != 0
-    else
-        isptr = (unsafe_load(convert(Ptr{UInt32}, tptr) + fielddesc_offset, i) >> 31) != 0
+if VERSION < v"0.5-"
+    LLT_ALIGN(v::Unsigned, typ::DataType) = (v + Base.type_alignment(typ) - 1) & ~UInt(Base.type_alignment(typ) - 1)
+    const fielddesc_type_offset = LLT_ALIGN(Base.field_offset(DataType,
+            findfirst(Base.fieldnames(DataType), :ninitialized) - 1) +
+        sizeof(fieldtype(DataType, :ninitialized)), UInt32) + sizeof(UInt32)
+    const fielddesc_offset = LLT_ALIGN(
+        LLT_ALIGN(fielddesc_type_offset + sizeof(UInt32), Ptr{Void}) + 2 * sizeof(Ptr{Void}),
+        DataType)
+    function jl_field_isptr(t::DataType, i::Int) # precondition: 1 <= i <= nfields(t)
+        tptr = pointer_from_objref(t)
+        fielddesc_type = (unsafe_load(convert(Ptr{UInt32}, tptr) + fielddesc_type_offset) >> 30) & 0x2
+        i = 2 * i
+        if fielddesc_type == 0
+            isptr = (unsafe_load(convert(Ptr{UInt8}, tptr) + fielddesc_offset, i) >> 7) != 0
+        elseif fielddesc_type == 1
+            isptr = (unsafe_load(convert(Ptr{UInt16}, tptr) + fielddesc_offset, i) >> 15) != 0
+        else
+            isptr = (unsafe_load(convert(Ptr{UInt32}, tptr) + fielddesc_offset, i) >> 31) != 0
+        end
+        #fldty = t.types[i]
+        #return typeof(fldty) === DataType && isbits(fldty::DataType)
     end
-    #fldty = t.types[i]
-    #return typeof(fldty) === DataType && isbits(fldty::DataType)
+else
+    const fielddesc_type_offset = sizeof(UInt32)
+    const fielddesc_offset = 2 * sizeof(UInt32)
+    function jl_field_isptr(t::DataType, i::Int) # precondition: 1 <= i <= nfields(t)
+        tptr = t.layout
+        fielddesc_type = (unsafe_load(convert(Ptr{UInt32}, tptr) + fielddesc_type_offset) >> 30) & 0x2
+        return unsafe_load(convert(Ptr{UInt8}, tptr + fielddesc_offset + ((i - 1) << (fielddesc_type + 1)))) & 1 != 0
+    end
 end
 
 @inline function fastserialize_any(s::SerializationState, obj::ANY)
@@ -418,14 +454,14 @@ function serialize_array_bits(s::IO, a)
         count = 1
         for i = 2:length(a)
             if a[i] != last || count == 127
-                write(s, UInt8((UInt8(last)<<7) | count))
+                write(s, UInt8((UInt8(last) << 7) | count))
                 last = a[i]
                 count = 1
             else
                 count += 1
             end
         end
-        write(s, UInt8((UInt8(last)<<7) | count))
+        write(s, UInt8((UInt8(last) << 7) | count))
     else
         write(s, a)
     end
@@ -440,7 +476,7 @@ function serialize_array(s::SerializationState, a::Array, xid::Int)
             na = length(a)::Int
             reloca = Array{Int}(na)
             for fld = 1:na
-                if isdefined(a, fld)
+                if isassigned(a, fld)
                     id = fastserialize_any(s, a[fld])::Int
                 else
                     id = 0
@@ -740,7 +776,7 @@ function fastdeserialize_any(s::FastDeSerializationState)
     pos = -1
     while true
         b = Int32(read(s.io, UInt8)::UInt8)
-        #println(b, " => ", b == 0 ? "..." : desertag(b))
+        #Core.println(b, " => ", b == 0 ? "..." : desertag(b))
         if b == UNDEFREF_TAG
             if pos < 0
                 pos = length(s.deserialized)
@@ -758,9 +794,9 @@ function fastdeserialize_any(s::FastDeSerializationState)
         elseif b == DATATYPE_TAG
             x = deserialize_datatype(s)
         elseif b == SYMBOL_TAG
-            x = symbol(read(s.io, UInt8, Int(read(s.io, UInt8)::UInt8)))
+            x = Symbol(read(s.io, UInt8, Int(read(s.io, UInt8)::UInt8)))
         elseif b == LONGSYMBOL_TAG
-            x = symbol(read(s.io, UInt8, Int(read(s.io, Int32)::Int32)))
+            x = Symbol(read(s.io, UInt8, Int(read(s.io, Int32)::Int32)))
         elseif b == UNION_TAG
             x = deserialize_union(s)
         elseif b == MODULE_TAG
@@ -790,10 +826,10 @@ function fastdeserialize_any(s::FastDeSerializationState)
                 end
             end
         end
-        #Core.Inference.println(x)
+        #Core.println(x)
         push!(s.deserialized, x)
     end
-    #Core.Inference.println(s.deserialized)
+    #Core.println(s.deserialized)
     for i = 1:read(s.io, Int)
         counter = read(s.io, Int) + pos
         field = read(s.io, Int)
@@ -820,7 +856,7 @@ function fastdeserialize_any(s::FastDeSerializationState)
             end
         end
     end
-    #println(s.deserialized)
+    #Core.println(s.deserialized)
     retid = read(s.io, Int)
     return s.deserialized[retid >= 0 ? retid : pos - retid]
 end
@@ -870,33 +906,49 @@ function deserialize_array(s::FastDeSerializationState)
     nd = read(s.io, Int)
     if nd == 1
         d1 = read(s.io, Int)
-        if elty !== Bool && isbits(elty)
-            return read!(s.io, Array(elty, d1))::Array
+        if elty !== Bool
+            a = Array{elty, 1}(d1)
+            if isbits(elty)
+                read!(s.io, a)
+            end
+            return a
         end
         dims = (Int(d1),)
+    elseif nd == 2
+        d1 = read(s.io, Int)
+        d2 = read(s.io, Int)
+        if elty !== Bool
+            a = Array{elty, 2}(d1, d2)
+            if isbits(elty)
+                read!(s.io, a)
+            end
+            return a
+        end
+        dims = (Int(d1), Int(d2))
     else
         dims = ntuple(i -> read(s.io, Int), nd)
     end
     if isbits(elty)
         # deserialize_array_bits
         n = prod(dims)::Int
-        if elty === Bool && n>0
-            A = Array(Bool, dims)
+        if elty === Bool && n > 0
+            A = Array{Bool, nd}(dims)
             i = 1
             while i <= n
                 b = read(s.io, UInt8)::UInt8
-                v = (b>>7) != 0
-                count = b&0x7f
-                nxt = i+count
+                v = (b >> 7) != 0
+                count = b & 0x7f
+                nxt = i + count
                 while i < nxt
-                    A[i] = v; i+=1
+                    A[i] = v
+                    i += 1
                 end
             end
         else
             A = read(s.io, elty, dims)
         end
     else
-        A = Array(elty, dims)
+        A = Array{elty, nd}(dims)
     end
     return A
 end
